@@ -5,3 +5,4 @@ token.json
 tokens.json
 tmp/
 .idea
+./data
