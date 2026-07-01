@@ -1,0 +1,16 @@
+{
+  "name": "gmail-jd-crawler",
+  "version": "1.0.0",
+  "description": "Gmail API와 Codex CLI로 채용 지원 이력을 JSON으로 정리하고 로컬 웹 화면으로 보여주는 Node.js 26 앱",
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "dotenv": "latest",
+    "googleapis": "latest"
+  }
+}

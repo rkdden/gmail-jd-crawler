@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>지원 이력</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>지원 이력</h1>
+          <p id="summary" class="summary">불러오는 중</p>
+        </div>
+        <div class="controls">
+          <label>
+            <span>검색</span>
+            <input id="searchInput" type="search" placeholder="기업명 또는 직무명">
+          </label>
+          <label>
+            <span>상태</span>
+            <select id="statusFilter">
+              <option value="all">전체</option>
+            </select>
+          </label>
+          <label>
+            <span>정렬</span>
+            <select id="sortSelect">
+              <option value="evidenceEmailReceivedAt:desc">이메일 수신일 최신순</option>
+              <option value="evidenceEmailReceivedAt:asc">이메일 수신일 오래된순</option>
+              <option value="appliedAt:desc">지원 날짜 최신순</option>
+              <option value="appliedAt:asc">지원 날짜 오래된순</option>
+            </select>
+          </label>
+        </div>
+      </header>
+
+      <section class="table-wrap" aria-live="polite">
+        <table>
+          <thead>
+            <tr>
+              <th>기업명</th>
+              <th>직무명</th>
+              <th>채용공고 링크</th>
+              <th>플랫폼명</th>
+              <th>지원 날짜</th>
+              <th>상태</th>
+              <th>근거 이메일 제목</th>
+              <th>근거 이메일 수신일</th>
+            </tr>
+          </thead>
+          <tbody id="applicationsBody"></tbody>
+        </table>
+        <div id="emptyState" class="empty" hidden>표시할 지원 이력이 없습니다.</div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
