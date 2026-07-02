@@ -1,8 +1,8 @@
 import "dotenv/config";
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
 import { createServer } from "node:http";
-import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline/promises";
@@ -12,6 +12,8 @@ import { google } from "googleapis";
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT_DIR = path.dirname(__filename);
+
+// 실행 중 읽고 쓰는 경로를 한 곳에 모아 두면 CLI, 웹서버, 테스트가 같은 파일을 바라본다.
 const PUBLIC_DIR = path.join(ROOT_DIR, "public");
 const DATA_DIR = path.join(ROOT_DIR, "data");
 const TMP_DIR = path.join(ROOT_DIR, "tmp");
@@ -19,10 +21,13 @@ const EMAILS_TMP_PATH = path.join(TMP_DIR, "emails.json");
 const CODEX_RESULT_PATH = path.join(TMP_DIR, "codex-result.json");
 const APPLICATIONS_PATH = path.join(DATA_DIR, "applications.json");
 const LEA_PATH = path.join(ROOT_DIR, "LEA.md");
+
 const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"];
 const UNKNOWN = "알수없음";
 const NONE = "없음";
 const VALID_STATUSES = new Set(["지원완료", "서류합격", "면접진행", "최종합격", "불합격", UNKNOWN]);
+
+// Gmail 검색은 넓게 가져온 뒤, 수신일과 본문 분석 단계에서 한 번 더 걸러낸다.
 const KEYWORDS = [
   "채용",
   "지원",
@@ -45,6 +50,29 @@ const MIME_TYPES = new Map([
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"]
 ]);
+
+/**
+ * @typedef {object} ParsedEmail
+ * @property {string} id
+ * @property {string} threadId
+ * @property {string} subject
+ * @property {string} from
+ * @property {string} receivedAt
+ * @property {string[]} links
+ * @property {string} body
+ */
+
+/**
+ * @typedef {object} Application
+ * @property {string} companyName
+ * @property {string} position
+ * @property {string} jobPostingUrl
+ * @property {string} platform
+ * @property {string} appliedAt
+ * @property {string} status
+ * @property {string} evidenceEmailSubject
+ * @property {string} evidenceEmailReceivedAt
+ */
 
 function relativePath(filePath) {
   return path.relative(ROOT_DIR, filePath).split(path.sep).join("/");
@@ -107,7 +135,7 @@ function errorMessage(error) {
   if (error?.response?.data?.error_description) return error.response.data.error_description;
   if (error?.response?.data?.error) return JSON.stringify(error.response.data.error);
   if (error?.errors?.length) return error.errors.map((item) => item.message).join("; ");
-  return error?.message || String(error);
+  return error?.message ?? String(error);
 }
 
 async function pathExists(filePath) {
@@ -177,12 +205,12 @@ function requireEnv(name) {
 
 function extractOAuthCode(inputValue) {
   const raw = inputValue.trim();
-  try {
-    const url = new URL(raw);
-    return url.searchParams.get("code") || raw;
-  } catch {
+  if (!URL.canParse(raw)) {
     return raw;
   }
+
+  const url = new URL(raw);
+  return url.searchParams.get("code") || raw;
 }
 
 async function requestInitialToken(oauth2Client, tokenPath) {
@@ -241,17 +269,18 @@ function decodeBase64Url(data) {
   return Buffer.from(data.replaceAll("-", "+").replaceAll("_", "/"), "base64").toString("utf8");
 }
 
+// Gmail API는 plain/html 본문과 첨부 메타데이터를 parts 안에 중첩해서 내려줄 수 있다.
 function collectBodyParts(payload, parts = []) {
   if (!payload) return parts;
 
   if (payload.body?.data) {
     parts.push({
-      mimeType: payload.mimeType || "",
+      mimeType: payload.mimeType ?? "",
       content: decodeBase64Url(payload.body.data)
     });
   }
 
-  for (const child of payload.parts || []) {
+  for (const child of payload.parts ?? []) {
     collectBodyParts(child, parts);
   }
 
@@ -283,7 +312,7 @@ function stripHtml(html) {
 
 function extractLinks(text) {
   const links = new Set();
-  const source = String(text || "");
+  const source = String(text ?? "");
 
   for (const match of source.matchAll(/https?:\/\/[^\s<>"')\]]+/gi)) {
     links.add(match[0].replace(/[.,;:!?]+$/g, ""));
@@ -299,11 +328,17 @@ function extractLinks(text) {
 }
 
 function headersToMap(headers = []) {
-  return new Map(headers.map((header) => [String(header.name || "").toLowerCase(), header.value || ""]));
+  return new Map(headers.map((header) => [String(header.name ?? "").toLowerCase(), header.value ?? ""]));
 }
 
+/**
+ * Gmail 원본 메시지를 Codex 분석에 넘기기 쉬운 얇은 이메일 객체로 정규화한다.
+ *
+ * @param {import("googleapis").gmail_v1.Schema$Message} message
+ * @returns {ParsedEmail}
+ */
 function parseGmailMessage(message) {
-  const payload = message.payload || {};
+  const payload = message.payload ?? {};
   const headers = headersToMap(payload.headers);
   const parts = collectBodyParts(payload);
   const plainBody = parts
@@ -319,7 +354,7 @@ function parseGmailMessage(message) {
   const body = (plainBody || stripHtml(htmlBody)).replace(/\r/g, "").trim();
   const receivedDate = message.internalDate
     ? new Date(Number(message.internalDate))
-    : parseDateOrNull(headers.get("date")) || new Date();
+    : parseDateOrNull(headers.get("date")) ?? new Date();
 
   return {
     id: message.id,
@@ -340,6 +375,7 @@ export async function fetchGmailEmails(gmail, sinceDate) {
   console.log(`Gmail 검색 쿼리: ${query}`);
 
   try {
+    // Gmail 검색어는 날짜 단위라, 이후 루프에서 정확한 시각 기준으로 다시 필터링한다.
     do {
       const response = await gmail.users.messages.list({
         userId: "me",
@@ -348,14 +384,14 @@ export async function fetchGmailEmails(gmail, sinceDate) {
         pageToken
       });
 
-      messageRefs.push(...(response.data.messages || []));
+      messageRefs.push(...(response.data.messages ?? []));
       pageToken = response.data.nextPageToken;
     } while (pageToken);
   } catch (error) {
     throw new Error(`Gmail 조회 실패: ${errorMessage(error)}`);
   }
 
-  console.log("messageRefs length" + messageRefs.length)
+  console.log(`Gmail 검색 결과: ${messageRefs.length}개 메시지`);
 
   const emails = [];
   for (const ref of messageRefs) {
@@ -375,7 +411,9 @@ export async function fetchGmailEmails(gmail, sinceDate) {
     }
   }
 
-  return emails.sort((a, b) => parseDateOrNull(a.receivedAt) - parseDateOrNull(b.receivedAt));
+  return emails.toSorted(
+    (a, b) => (parseDateOrNull(a.receivedAt)?.getTime() ?? 0) - (parseDateOrNull(b.receivedAt)?.getTime() ?? 0)
+  );
 }
 
 export async function saveFetchedEmails(emails) {
@@ -434,6 +472,7 @@ function parseArgString(value) {
 function codexArgs() {
   const configured = process.env.CODEX_EXEC_ARGS?.trim();
   if (configured) {
+    // 환경변수에 따옴표가 포함될 수 있어 shell 없이 사용할 인자 배열로 직접 분해한다.
     return parseArgString(configured).map((arg) => (arg === "." ? ROOT_DIR : arg));
   }
 
@@ -451,6 +490,7 @@ function codexArgs() {
 
 function runChildProcess(command, args, options = {}) {
   return new Promise((resolve, reject) => {
+    // shell을 거치지 않고 인자 배열로 실행해 공백/따옴표가 포함된 경로를 안전하게 넘긴다.
     const child = spawn(command, args, {
       cwd: ROOT_DIR,
       env: process.env,
@@ -492,6 +532,7 @@ async function assertCodexInstalled(command) {
 }
 
 function buildCodexPrompt(emailPath, resultPath) {
+  // Codex가 분석 결과 파일 하나만 쓰도록 입력/출력 경로와 JSON 스키마를 명확히 제한한다.
   return [
     "tmp/emails.json 파일을 읽어 채용 지원 이력만 추출하세요.",
     "",
@@ -552,6 +593,12 @@ async function readJsonArray(filePath) {
   }
 }
 
+/**
+ * Codex 결과와 기존 저장 데이터를 같은 형태로 맞춘다.
+ *
+ * @param {Partial<Application>} raw
+ * @returns {Application}
+ */
 function normalizeApplication(raw) {
   const evidenceDate = cleanString(raw.evidenceEmailReceivedAt);
   const appliedAt = normalizeDateOnly(raw.appliedAt) || normalizeDateOnly(evidenceDate) || UNKNOWN;
@@ -570,6 +617,7 @@ function normalizeApplication(raw) {
 }
 
 function applicationKey(application) {
+  // 같은 회사라도 직무명 또는 지원일이 다르면 별도 지원 이력으로 보존한다.
   return [application.companyName, application.position, application.appliedAt]
     .map((value) => String(value).trim().toLowerCase())
     .join("|");
@@ -580,6 +628,7 @@ function evidenceTime(application) {
 }
 
 function mergeKnownFields(existing, incoming) {
+  // 최신 근거 이메일을 우선하되, 새 값이 불명확하면 기존에 알던 값을 유지한다.
   return {
     companyName: incoming.companyName !== UNKNOWN ? incoming.companyName : existing.companyName,
     position: incoming.position !== UNKNOWN ? incoming.position : existing.position,
@@ -617,7 +666,7 @@ export async function mergeAndSaveApplications(newApplications) {
     upsertApplication(merged, application);
   }
 
-  const rows = [...merged.values()].sort((a, b) => {
+  const rows = [...merged.values()].toSorted((a, b) => {
     const evidenceDelta = evidenceTime(b) - evidenceTime(a);
     if (evidenceDelta) return evidenceDelta;
     return String(b.appliedAt).localeCompare(String(a.appliedAt));
@@ -637,14 +686,16 @@ function newestEmailDate(emails) {
   const newest = emails
     .map((email) => parseDateOrNull(email.receivedAt))
     .filter(Boolean)
-    .sort((a, b) => b - a)[0];
-  return newest || new Date();
+    .toSorted((a, b) => b - a)
+    .at(0);
+  return newest ?? new Date();
 }
 
 function fileForRequest(requestUrl) {
   const url = new URL(requestUrl, "http://localhost");
   const pathname = decodeURIComponent(url.pathname);
 
+  // 정적 서버는 필요한 파일만 allowlist로 제공해 임의 경로 접근을 막는다.
   if (pathname === "/") return path.join(PUBLIC_DIR, "index.html");
   if (pathname === "/data/applications.json") return APPLICATIONS_PATH;
   if (pathname === "/app.js") return path.join(PUBLIC_DIR, "app.js");
@@ -653,6 +704,7 @@ function fileForRequest(requestUrl) {
 }
 
 export async function startServer(port = 3000) {
+  // 외부 프레임워크 없이 필요한 정적 파일만 제공하는 작은 로컬 서버다.
   const server = createServer(async (req, res) => {
     if (req.method !== "GET") {
       res.writeHead(405, { "content-type": "text/plain; charset=utf-8" });
@@ -660,7 +712,7 @@ export async function startServer(port = 3000) {
       return;
     }
 
-    const filePath = fileForRequest(req.url || "/");
+    const filePath = fileForRequest(req.url ?? "/");
     if (!filePath) {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("Not Found");
@@ -669,7 +721,7 @@ export async function startServer(port = 3000) {
 
     try {
       const content = await fs.readFile(filePath);
-      const contentType = MIME_TYPES.get(path.extname(filePath)) || "application/octet-stream";
+      const contentType = MIME_TYPES.get(path.extname(filePath)) ?? "application/octet-stream";
       res.writeHead(200, {
         "content-type": contentType,
         "cache-control": "no-store"
@@ -700,6 +752,7 @@ export async function startServer(port = 3000) {
 }
 
 export async function main() {
+  // 파이프라인 순서: 기준시각 확인 -> Gmail 수집 -> Codex 분석 -> JSON 병합 -> 웹서버 시작.
   await ensureRuntimeFiles();
   const access = await readLastEmailAccess();
   if (access.usedFallback) {
