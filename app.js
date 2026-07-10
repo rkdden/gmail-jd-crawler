@@ -1,11 +1,11 @@
 import "dotenv/config";
 
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import process from "node:process";
-import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { google } from "googleapis";
@@ -23,6 +23,8 @@ const APPLICATIONS_PATH = path.join(DATA_DIR, "applications.json");
 const LEA_PATH = path.join(ROOT_DIR, "LEA.md");
 
 const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"];
+const DEFAULT_OAUTH_REDIRECT_URI = "http://127.0.0.1:42813/oauth2callback";
+const DEFAULT_OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
 const UNKNOWN = "알수없음";
 const NONE = "없음";
 const VALID_STATUSES = new Set(["지원완료", "서류합격", "면접진행", "최종합격", "불합격", UNKNOWN]);
@@ -203,38 +205,285 @@ function requireEnv(name) {
   return value;
 }
 
-function extractOAuthCode(inputValue) {
-  const raw = inputValue.trim();
-  if (!URL.canParse(raw)) {
-    return raw;
-  }
-
-  const url = new URL(raw);
-  return url.searchParams.get("code") || raw;
+function isLoopbackHost(hostname) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "[::1]";
 }
 
-async function requestInitialToken(oauth2Client, tokenPath) {
-  const authUrl = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: GMAIL_SCOPES
+function normalizeLoopbackHost(hostname) {
+  if (hostname === "::1" || hostname === "[::1]") return "::1";
+  return hostname;
+}
+
+function formatRedirectHost(hostname) {
+  return hostname === "::1" ? "[::1]" : hostname;
+}
+
+function isLegacyRedirectUri(redirectUri) {
+  if (!URL.canParse(redirectUri)) return false;
+  const url = new URL(redirectUri);
+  return (
+    url.protocol === "http:" &&
+    isLoopbackHost(url.hostname) &&
+    !url.port &&
+    !url.search &&
+    !url.hash &&
+    (url.pathname === "" || url.pathname === "/")
+  );
+}
+
+function configuredOAuthRedirectUri() {
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI?.trim();
+  if (!redirectUri || isLegacyRedirectUri(redirectUri)) {
+    return DEFAULT_OAUTH_REDIRECT_URI;
+  }
+  return redirectUri;
+}
+
+function oauthCallbackConfig(redirectUri) {
+  if (!URL.canParse(redirectUri)) {
+    throw new Error(`GOOGLE_REDIRECT_URI 값이 URL 형식이 아닙니다: ${redirectUri}`);
+  }
+
+  const url = new URL(redirectUri);
+  if (url.protocol !== "http:" || !isLoopbackHost(url.hostname)) {
+    throw new Error("GOOGLE_REDIRECT_URI는 http://127.0.0.1 또는 http://localhost 콜백 URL이어야 합니다.");
+  }
+  if (!url.port) {
+    throw new Error(`GOOGLE_REDIRECT_URI에는 포트가 필요합니다. 예: ${DEFAULT_OAUTH_REDIRECT_URI}`);
+  }
+  if (url.search || url.hash) {
+    throw new Error("GOOGLE_REDIRECT_URI에는 query string이나 hash를 넣지 마세요.");
+  }
+
+  const listenHost = normalizeLoopbackHost(url.hostname);
+  return {
+    callbackPath: url.pathname || "/",
+    listenHost,
+    port: Number(url.port),
+    redirectUri: `${url.protocol}//${formatRedirectHost(listenHost)}:${url.port}${url.pathname || "/"}`
+  };
+}
+
+function oauthTimeoutMs() {
+  const configured = Number(process.env.GOOGLE_OAUTH_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_OAUTH_TIMEOUT_MS;
+}
+
+function oauthStateToken() {
+  return randomBytes(24).toString("base64url");
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function sendOAuthPage(res, statusCode, title, message, callback) {
+  const html = `<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2937; background: #f8fafc; }
+    main { max-width: 560px; margin: 18vh auto; padding: 0 24px; }
+    h1 { font-size: 28px; line-height: 1.2; margin: 0 0 12px; }
+    p { font-size: 16px; line-height: 1.6; margin: 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+  </main>
+</body>
+</html>`;
+  res.writeHead(statusCode, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  res.end(html, callback);
+}
+
+async function startOAuthCallbackServer(redirectUri, expectedState) {
+  const config = oauthCallbackConfig(redirectUri);
+  let resolveCode;
+  let rejectCode;
+  const codePromise = new Promise((resolve, reject) => {
+    resolveCode = resolve;
+    rejectCode = reject;
+  });
+  let settled = false;
+  let timeout;
+
+  const server = createServer((req, res) => {
+    if (req.method !== "GET") {
+      res.writeHead(405, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Method Not Allowed");
+      return;
+    }
+
+    const requestUrl = new URL(req.url ?? "/", config.redirectUri);
+    if (requestUrl.pathname !== config.callbackPath) {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Not Found");
+      return;
+    }
+
+    const receivedState = requestUrl.searchParams.get("state");
+    const oauthError = requestUrl.searchParams.get("error");
+    const oauthErrorDescription = requestUrl.searchParams.get("error_description");
+    const code = requestUrl.searchParams.get("code");
+
+    const finish = (error, tokenCode) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      server.close(() => {
+        if (error) {
+          rejectCode(error);
+          return;
+        }
+        resolveCode(tokenCode);
+      });
+    };
+
+    if (receivedState !== expectedState) {
+      sendOAuthPage(res, 400, "Gmail 인증 실패", "OAuth state 검증에 실패했습니다. 터미널에서 다시 실행하세요.", () => {
+        finish(new Error("OAuth state 검증 실패"));
+      });
+      return;
+    }
+
+    if (oauthError) {
+      const message = oauthErrorDescription || oauthError;
+      sendOAuthPage(res, 400, "Gmail 인증 실패", `Google 인증이 완료되지 않았습니다: ${message}`, () => {
+        finish(new Error(message));
+      });
+      return;
+    }
+
+    if (!code) {
+      sendOAuthPage(res, 400, "Gmail 인증 실패", "Google 응답에 인증 코드가 없습니다. 터미널에서 다시 실행하세요.", () => {
+        finish(new Error("Google 응답에 인증 코드가 없습니다."));
+      });
+      return;
+    }
+
+    sendOAuthPage(res, 200, "Gmail 인증 완료", "이 창을 닫고 터미널로 돌아가세요.", () => {
+      finish(null, code);
+    });
   });
 
-  console.log("\nGmail OAuth 인증 URL:");
-  console.log(authUrl);
-  console.log("\n브라우저에서 인증한 뒤 리디렉션 URL의 code 값을 입력하세요.");
+  const close = () => {
+    if (!settled) {
+      settled = true;
+      clearTimeout(timeout);
+      server.close();
+      rejectCode(new Error("OAuth 인증이 중단되었습니다."));
+    }
+  };
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question("인증 코드: ");
-  rl.close();
+  return new Promise((resolve, reject) => {
+    server.once("error", (error) => {
+      if (error.code === "EADDRINUSE") {
+        reject(new Error(`OAuth 콜백 포트 ${config.port}이 이미 사용 중입니다. GOOGLE_REDIRECT_URI의 포트를 바꾸세요.`));
+        return;
+      }
+      reject(new Error(`OAuth 콜백 서버 시작 실패: ${errorMessage(error)}`));
+    });
+
+    server.listen(config.port, config.listenHost, () => {
+      timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          server.close();
+          rejectCode(new Error("Gmail 인증 시간이 초과되었습니다. Google 화면에 redirect_uri_mismatch가 보이면 OAuth 클라이언트의 리디렉션 URI 설정을 확인하세요."));
+        }
+      }, oauthTimeoutMs());
+
+      resolve({
+        close,
+        redirectUri: config.redirectUri,
+        waitForCode: () => codePromise
+      });
+    });
+  });
+}
+
+function browserOpenCommand(url) {
+  if (process.platform === "darwin") {
+    return { command: "open", args: [url] };
+  }
+  if (process.platform === "win32") {
+    return { command: "cmd", args: ["/c", "start", "", url] };
+  }
+  return { command: "xdg-open", args: [url] };
+}
+
+async function openAuthUrl(url) {
+  return new Promise((resolve) => {
+    const { command, args } = browserOpenCommand(url);
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    let settled = false;
+    const finish = (opened) => {
+      if (settled) return;
+      settled = true;
+      resolve(opened);
+    };
+
+    child.once("error", () => finish(false));
+    child.once("spawn", () => {
+      child.unref();
+      finish(true);
+    });
+  });
+}
+
+async function requestInitialToken(clientId, clientSecret, tokenPath) {
+  const redirectUri = configuredOAuthRedirectUri();
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  const state = oauthStateToken();
+  const { codeVerifier, codeChallenge } = await oauth2Client.generateCodeVerifierAsync();
+  const callbackServer = await startOAuthCallbackServer(redirectUri, state);
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+    prompt: "consent",
+    scope: GMAIL_SCOPES,
+    state
+  });
 
   try {
-    const { tokens } = await oauth2Client.getToken(extractOAuthCode(answer));
+    console.log("\nGmail OAuth 로그인 URL:");
+    console.log(authUrl);
+    const opened = await openAuthUrl(authUrl);
+    if (opened) {
+      console.log("\n브라우저에서 Google 계정으로 로그인하세요. 인증이 끝나면 자동으로 계속됩니다.");
+    } else {
+      console.log("\n브라우저를 자동으로 열지 못했습니다. 위 URL을 직접 여세요.");
+    }
+
+    const code = await callbackServer.waitForCode();
+    const { tokens } = await oauth2Client.getToken({
+      code,
+      codeVerifier,
+      redirect_uri: callbackServer.redirectUri
+    });
     oauth2Client.setCredentials(tokens);
     await fs.mkdir(path.dirname(tokenPath), { recursive: true });
     await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2), "utf8");
     console.log(`토큰 저장 완료: ${relativePath(tokenPath)}`);
+    return oauth2Client;
   } catch (error) {
+    callbackServer.close();
     throw new Error(`Gmail 인증 실패: ${errorMessage(error)}`);
   }
 }
@@ -242,9 +491,8 @@ async function requestInitialToken(oauth2Client, tokenPath) {
 export async function createOAuthClient() {
   const clientId = requireEnv("GOOGLE_CLIENT_ID");
   const clientSecret = requireEnv("GOOGLE_CLIENT_SECRET");
-  const redirectUri = requireEnv("GOOGLE_REDIRECT_URI");
   const tokenPath = path.resolve(ROOT_DIR, process.env.GOOGLE_TOKEN_PATH || "token.json");
-  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+  const oauth2Client = new google.auth.OAuth2(clientId, clientSecret, configuredOAuthRedirectUri());
 
   if (await pathExists(tokenPath)) {
     try {
@@ -256,8 +504,7 @@ export async function createOAuthClient() {
     }
   }
 
-  await requestInitialToken(oauth2Client, tokenPath);
-  return oauth2Client;
+  return requestInitialToken(clientId, clientSecret, tokenPath);
 }
 
 function buildGmailQuery(sinceDate) {

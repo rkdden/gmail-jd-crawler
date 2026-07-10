@@ -23,13 +23,14 @@ cp .env.example .env
 ```env
 GOOGLE_CLIENT_ID=your-google-oauth-client-id
 GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
-GOOGLE_REDIRECT_URI=http://localhost
 ```
 
 선택 값:
 
 ```env
+GOOGLE_REDIRECT_URI=http://127.0.0.1:42813/oauth2callback
 GOOGLE_TOKEN_PATH=token.json
+GOOGLE_OAUTH_TIMEOUT_MS=300000
 PORT=3000
 CODEX_COMMAND=codex
 CODEX_EXEC_ARGS=--ask-for-approval never exec --sandbox workspace-write -C . --skip-git-repo-check
@@ -37,16 +38,20 @@ CODEX_EXEC_ARGS=--ask-for-approval never exec --sandbox workspace-write -C . --s
 
 민감정보와 OAuth 토큰은 코드에 하드코딩하지 않고 `.env`와 `token.json`을 사용합니다. 두 파일은 `.gitignore`에 포함되어 있습니다.
 
+Gmail 메일함은 사용자 소유 데이터이므로 Google API 키만으로는 조회할 수 없습니다. 이 프로젝트는 OAuth로 사용자의 동의를 받은 뒤 `gmail.readonly` 권한의 토큰을 저장해 사용합니다.
+
 ## Gmail OAuth 설정 방법
 
 1. Google Cloud Console에서 프로젝트를 만들고 Gmail API를 활성화합니다.
 2. OAuth 동의 화면을 설정합니다.
 3. OAuth 클라이언트 ID를 생성합니다.
-4. 애플리케이션 유형은 데스크톱 앱 또는 웹 애플리케이션을 사용할 수 있습니다.
-5. 웹 애플리케이션을 사용하는 경우 승인된 리디렉션 URI에 `.env`의 `GOOGLE_REDIRECT_URI` 값을 등록합니다.
+4. 로컬에서만 사용할 경우 애플리케이션 유형은 데스크톱 앱을 권장합니다.
+5. 웹 애플리케이션 OAuth 클라이언트를 사용하는 경우 승인된 리디렉션 URI에 `.env`의 `GOOGLE_REDIRECT_URI` 값을 정확히 등록합니다. 기본값은 `http://127.0.0.1:42813/oauth2callback`입니다.
 6. 발급된 클라이언트 ID와 클라이언트 시크릿을 `.env`에 입력합니다.
 
-최초 실행 시 터미널에 인증 URL이 출력됩니다. 브라우저에서 인증한 뒤 리디렉션 URL의 `code` 값을 터미널에 입력하면 `token.json`에 토큰이 저장됩니다. 이후 실행부터는 저장된 토큰을 사용합니다.
+최초 실행 시 로컬 OAuth 콜백 서버가 잠시 실행되고 기본 브라우저에 Google 로그인 화면이 열립니다. 로그인과 권한 동의가 끝나면 앱이 인증 코드를 자동으로 받아 `token.json`에 토큰을 저장합니다. 이후 실행부터는 저장된 토큰을 사용합니다.
+
+Google 화면에서 `redirect_uri_mismatch`가 보이면 OAuth 클라이언트 유형을 데스크톱 앱으로 다시 만들거나, 웹 애플리케이션 OAuth 클라이언트의 승인된 리디렉션 URI와 `.env`의 `GOOGLE_REDIRECT_URI` 값을 같은 URL로 맞추세요.
 
 ## 실행 방법
 
@@ -119,6 +124,6 @@ http://localhost:3000
 
 - Codex CLI 기본 명령은 `codex`이고, 비대화형 실행은 `codex exec`를 사용한다고 가정합니다. 다른 설치 형태라면 `.env`의 `CODEX_COMMAND` 또는 `CODEX_EXEC_ARGS`를 조정합니다.
 - Gmail 검색은 `after:YYYY/MM/DD`와 키워드 OR 조건으로 1차 조회한 뒤, Node.js에서 `last_email_accessed_at` 이후 수신 메일만 다시 필터링합니다.
-- Gmail OAuth 리디렉션은 로컬 콜백 서버를 별도로 띄우지 않고 사용자가 URL의 `code` 값을 터미널에 붙여넣는 방식으로 처리합니다.
+- Gmail OAuth 리디렉션은 `.env`의 `GOOGLE_REDIRECT_URI` 값으로 로컬 콜백 서버를 잠시 띄워 처리합니다.
 - 지원 날짜가 분석 결과에 없으면 근거 이메일 수신일의 날짜를 사용합니다.
 - Codex CLI는 `tmp/codex-result.json` 외의 파일을 수정하지 않도록 프롬프트로 제한합니다.
